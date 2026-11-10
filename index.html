@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Window Demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff; }
+  canvas { display: block; position: fixed; inset: 0; }
+  .ui { position: fixed; z-index: 2; pointer-events: none; }
+  .top { top: 20px; left: 24px; right: 24px; display: flex; justify-content: space-between; font-weight: 700; font-size: 14px; }
+  .shade { position: fixed; z-index: 1; left: 0; right: 0; bottom: 0; height: 45vh; pointer-events: none; background: linear-gradient(to top, rgba(0,0,0,.75), rgba(0,0,0,0)); }
+  .top { text-shadow: 0 1px 8px rgba(0,0,0,.7); }
+  .bottom { left: 24px; right: 24px; bottom: 24px; display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: clamp(48px, 11vw, 150px); line-height: .82; letter-spacing: -.05em; }
+  .side { max-width: 340px; font-size: 13px; line-height: 1.45; }
+  .side p { margin: 0 0 12px; opacity: .85; }
+  button { pointer-events: auto; font: inherit; font-weight: 700; color: #000; background: #fff; border: 0; border-radius: 999px; padding: 10px 18px; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #status { font-weight: 400; opacity: .8; }
+  kbd { border: 1px solid rgba(255,255,255,.5); border-radius: 4px; padding: 0 5px; font: inherit; font-size: 12px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
+} }
+</script>
+</head>
+<body>
+<div class="ui top"><span>WINDOW</span><span id="status">mouse</span></div>
+<div class="shade"></div>
+<div class="ui bottom">
+  <h1>WINDOW</h1>
+  <div class="side">
+    <p>The screen is a window into a box. Move the mouse, or turn on the webcam and move your head. <kbd>I</kbd> flips left/right, <kbd>S</kbd> switches splat / box room, <kbd>D</kbd> shows the window frame. Drop a .spz or .ply file to load your own scene.</p>
+    <button id="cam">Enable head tracking</button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { SparkRenderer, SplatMesh } from '@sparkjsdev/spark';
+
+// ---------- settings ----------
+const cfg = {
+  halfW: 1,            // half the window width, in world units
+  viewDist: 2.4,       // resting eye distance from the window
+  roomDepth: 7,        // how far the box goes back
+  near: 0.05, far: 2000,
+  strengthX: 1.1,      // how far the eye travels sideways (x halfW)
+  strengthY: 0.9,
+  depthStrength: 0.35, // lean in / out
+  invertX: false,
+  holdMs: 200,         // keep last pose after the face is lost
+  easeMs: 300,         // then ease back to the mouse
+  mouseMs: 90,         // mouse follow time; lower = snappier, higher = floatier
+  minCutoff: 1.2, beta: 0.8, // One Euro filter
+  splat: {
+    // any .spz / .ply / .splat / .sog file; override with ?splat=URL or drop a file on the page
+    url: new URLSearchParams(location.search).get('splat') || 'assets/corridor.ply',
+    // 'camera': the file is in the source photo's camera frame (single-image splats such as SHARP);
+    //           the photo's camera is placed at the viewer's eye. 'bbox': centre and scale by bounding box.
+    fit: new URLSearchParams(location.search).get('splat') ? 'bbox' : 'camera',
+    pixelRatio: 1,     // render scale for the splat; raise toward 2 for sharpness, lower for speed
+    hfov: 94.5,        // camera fit: horizontal field of view of the source photo, degrees
+    aspect: 1344 / 752,//             and its width / height
+    overscan: 1.5,     // camera fit: how much of the photo is kept outside the window as margin
+    nearDepth: 1.6,    // camera fit: depth (in file units) of the nearest content, which lands on the glass
+    strength: 0.32,    // camera fit: head travel multiplier; single-photo splats only hold up for small moves
+    flip: true,        // most captures are y-down; turn them upright
+    fitWidth: 3.2,     // scene width in world units after auto-fit (window is 2 wide)
+    front: 0.6,        // how far the nearest splats sit in front of the glass
+    offset: [0, 0, 0], // manual nudge after auto-fit
+    yaw: 0
+  }
+};
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+// Splats are soft, so they don't need Retina resolution; drawing them at 2x quarters the frame rate.
+const pixelRatioFor = m => m === 'splat' ? Math.min(devicePixelRatio, cfg.splat.pixelRatio) : Math.min(devicePixelRatio, 2);
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#050608');
+scene.fog = new THREE.Fog('#050608', 3, cfg.roomDepth + 4);
+
+const camera = new THREE.PerspectiveCamera();
+camera.matrixAutoUpdate = true;
+
+scene.add(new THREE.AmbientLight('#8fa3b8', 0.55));
+const lamp = new THREE.PointLight('#ffe2b8', 28, 14, 2);
+scene.add(lamp);
+const backLamp = new THREE.PointLight('#7fd0ff', 10, 8, 2);
+scene.add(backLamp);
+
+function gridTexture(color) {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = color; g.fillRect(0, 0, 256, 256);
+  g.strokeStyle = 'rgba(255,255,255,.28)'; g.lineWidth = 3;
+  g.strokeRect(0, 0, 256, 256);
+  g.strokeStyle = 'rgba(255,255,255,.08)'; g.lineWidth = 1;
+  for (let i = 64; i < 256; i += 64) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i, 256); g.moveTo(0, i); g.lineTo(256, i); g.stroke(); }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const room = new THREE.Group(); scene.add(room);
+
+// ---------- Gaussian splat scene ----------
+const spark = new SparkRenderer({ renderer }); scene.add(spark);
+const splatHolder = new THREE.Group(); scene.add(splatHolder);
+let mode = new URLSearchParams(location.search).get('scene') === 'room' ? 'room' : 'splat';
+let splatState = 'idle';
+
+function applyMode() {
+  renderer.setPixelRatio(pixelRatioFor(mode));
+  renderer.setSize(innerWidth, innerHeight);
+  room.visible = mode === 'room';
+  splatHolder.visible = mode === 'splat';
+  scene.fog.far = mode === 'room' ? cfg.roomDepth + 4 : 1e6;
+  scene.fog.near = mode === 'room' ? 3 : 1e6 - 1;
+}
+
+// camera fit: eye distance at which the photo just covers the window (like CSS background-size: cover)
+function camDist() {
+  const th = Math.tan(cfg.splat.hfov * Math.PI / 360), tv = th / cfg.splat.aspect;
+  return cfg.splat.overscan * Math.max(cfg.halfW / th, halfH / tv);
+}
+
+// auto-fit: centre the capture behind the glass and scale it to cover the window
+let splatBox = null;
+function fitSplat() {
+  if (!splatBox) return;
+  if (cfg.splat.fit === 'camera') {
+    const d = camDist();
+    splatHolder.scale.setScalar(d / cfg.splat.nearDepth);
+    splatHolder.rotation.y = cfg.splat.yaw;
+    splatHolder.position.set(cfg.splat.offset[0], cfg.splat.offset[1], d + cfg.splat.offset[2]);
+    return;
+  }
+  const b = splatBox, f = cfg.splat.flip ? -1 : 1;
+  const size = b.getSize(new THREE.Vector3()), c = b.getCenter(new THREE.Vector3());
+  const k = cfg.splat.fitWidth / (2 * cfg.halfW);            // overscan, so edges stay covered when the eye moves
+  const s = Math.max(2 * cfg.halfW * k / Math.max(size.x, 1e-6), 2 * halfH * k / Math.max(size.y, 1e-6));
+  const zFront = f < 0 ? -b.min.z : b.max.z;                 // nearest splats, before scaling
+  splatHolder.scale.setScalar(s);
+  splatHolder.rotation.y = cfg.splat.yaw;
+  splatHolder.position.set(-c.x * s + cfg.splat.offset[0], -f * c.y * s + cfg.splat.offset[1], cfg.splat.front - zFront * s + cfg.splat.offset[2]);
+}
+
+async function loadSplat(opts) {
+  splatState = 'loading';
+  try {
+    const mesh = new SplatMesh(opts);
+    await mesh.initialized;
+    splatHolder.clear();
+    if (cfg.splat.flip) mesh.quaternion.set(1, 0, 0, 0);
+    splatHolder.add(mesh);
+    splatBox = mesh.getBoundingBox(true);
+    fitSplat();
+    splatState = 'ready';
+  } catch (err) {
+    console.warn('[splat] load failed', err);
+    splatState = 'failed'; mode = 'room'; applyMode();
+  }
+}
+loadSplat({ url: cfg.splat.url });
+
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', async e => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files?.[0]; if (!file) return;
+  mode = 'splat'; cfg.splat.fit = 'bbox'; applyMode();
+  loadSplat({ fileBytes: await file.arrayBuffer(), fileName: file.name });
+});
+const frame = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#ff3d6e' }));
+frame.visible = false; scene.add(frame);
+let halfH = 1;
+
+function wall(w, h, tex, rx, ry, x, y, z, repU, repV) {
+  const t = tex.clone(); t.needsUpdate = true; t.repeat.set(repU, repV);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshStandardMaterial({ map: t, roughness: .9 }));
+  m.rotation.set(rx, ry, 0); m.position.set(x, y, z); room.add(m);
+}
+
+function buildRoom() {
+  room.clear();
+  const W = cfg.halfW, H = halfH, D = cfg.roomDepth;
+  const wallTex = gridTexture('#2b3440'), floorTex = gridTexture('#3a332c'), backTex = gridTexture('#1d2a33');
+  const cell = 0.5; // one grid square = 0.5 world units, so squares stay square on every wall
+  wall(2 * W, D, floorTex, -Math.PI / 2, 0, 0, -H, -D / 2, 2 * W / cell, D / cell);   // floor
+  wall(2 * W, D, wallTex, Math.PI / 2, 0, 0, H, -D / 2, 2 * W / cell, D / cell);      // ceiling
+  wall(D, 2 * H, wallTex, 0, Math.PI / 2, -W, 0, -D / 2, D / cell, 2 * H / cell);     // left
+  wall(D, 2 * H, wallTex, 0, -Math.PI / 2, W, 0, -D / 2, D / cell, 2 * H / cell);     // right
+  wall(2 * W, 2 * H, backTex, 0, 0, 0, 0, -D, 2 * W / cell, 2 * H / cell);            // back
+
+  const std = (c, extra = {}) => new THREE.MeshStandardMaterial({ color: c, roughness: .55, ...extra });
+  const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); room.add(m); return m; };
+
+  // pillars marching back: strong parallax cue
+  for (let i = 0; i < 4; i++) {
+    const z = -1.2 - i * 1.5, r = 0.07;
+    add(new THREE.CylinderGeometry(r, r, 2 * H, 20), std('#c9c2b4'), -W + 0.3, 0, z);
+    add(new THREE.CylinderGeometry(r, r, 2 * H, 20), std('#c9c2b4'), W - 0.3, 0, z);
+  }
+  // things at different depths
+  add(new THREE.SphereGeometry(0.16, 32, 20), std('#ff5a3c', { roughness: .3 }), -0.35, -H + 0.16, -0.7);
+  add(new THREE.BoxGeometry(0.3, 0.3, 0.3), std('#3ca0ff'), 0.4, -H + 0.15, -1.6).rotation.y = 0.5;
+  add(new THREE.SphereGeometry(0.12, 32, 20), std('#ffd23c', { roughness: .3 }), 0.15, 0.1 * H, -2.6);
+  add(new THREE.TorusGeometry(0.22, 0.05, 16, 48), std('#7dffb0', { roughness: .3 }), -0.3, 0.25 * H, -3.6);
+  add(new THREE.BoxGeometry(0.5, 0.9 * H, 0.5), std('#8a7fff'), 0.45, -H + 0.45 * H, -4.6).rotation.y = 0.3;
+  // a thin string with a ball hanging right behind the glass
+  add(new THREE.CylinderGeometry(0.004, 0.004, 0.6 * H, 6), std('#ffffff'), 0.55, H - 0.3 * H, -0.25);
+  add(new THREE.SphereGeometry(0.06, 24, 16), std('#ffffff', { emissive: '#ffffff', emissiveIntensity: .4 }), 0.55, H - 0.6 * H - 0.06, -0.25);
+
+  lamp.position.set(0, H * 0.7, -1.6);
+  backLamp.position.set(0, 0, -cfg.roomDepth + 1.2);
+
+  // debug: the window rectangle itself, at z = 0
+  const p = [-W, -H, 0, W, -H, 0, W, -H, 0, W, H, 0, W, H, 0, -W, H, 0, -W, H, 0, -W, -H, 0];
+  frame.geometry.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+}
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  halfH = cfg.halfW * innerHeight / innerWidth;
+  buildRoom();
+  fitSplat();
+}
+addEventListener('resize', resize); resize(); applyMode();
+
+// ---------- the trick: off-axis ("window") projection ----------
+// The window is the rectangle [-halfW..halfW] x [-halfH..halfH] at z = 0.
+// The camera sits at the eye and never rotates; the frustum is skewed so its
+// edges always pass through the window's edges.
+function setWindowCamera(ex, ey, ez) {
+  const n = cfg.near, d = Math.max(ez, n * 1.01);
+  const l = n * (-cfg.halfW - ex) / d, r = n * (cfg.halfW - ex) / d;
+  const b = n * (-halfH - ey) / d,     t = n * (halfH - ey) / d;
+  camera.position.set(ex, ey, d);
+  camera.quaternion.identity();
+  camera.projectionMatrix.makePerspective(l, r, t, b, n, cfg.far);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+}
+
+// ---------- One Euro filter (smooth when still, responsive when moving) ----------
+function oneEuro() {
+  let x = 0, dx = 0, primed = false;
+  const alpha = (cut, dt) => 1 / (1 + 1 / (2 * Math.PI * cut * dt));
+  return {
+    reset() { primed = false; },
+    filter(v, dt, minCutoff, beta) {
+      if (!primed || !(dt > 0)) { x = v; dx = 0; primed = true; return v; }
+      const d = (v - x) / dt;
+      dx += alpha(1, dt) * (d - dx);
+      x += alpha(minCutoff + beta * Math.abs(dx), dt) * (v - x);
+      return x;
+    }
+  };
+}
+const fx = oneEuro(), fy = oneEuro(), fz = oneEuro();
+
+// ---------- inputs ----------
+const mouse = { x: 0, y: 0, z: 0 };
+addEventListener('pointermove', e => {
+  mouse.x = (e.clientX / innerWidth - .5) * 2;
+  mouse.y = (.5 - e.clientY / innerHeight) * 2;
+});
+addEventListener('keydown', e => {
+  if (e.key === 'i' || e.key === 'I') cfg.invertX = !cfg.invertX;
+  if (e.key === 'd' || e.key === 'D') frame.visible = !frame.visible;
+  if (e.key === 's' || e.key === 'S') { mode = mode === 'room' ? 'splat' : 'room'; applyMode(); }
+});
+
+const statusEl = document.getElementById('status');
+const camBtn = document.getElementById('cam');
+let landmarker = null, video = null, lastVideoTime = -1;
+let face = null, lastFaceT = -1e9;          // latest raw head pose, normalised -1..1
+const NOSE = 1, EYE_A = 33, EYE_B = 263; // MediaPipe face mesh indices
+
+camBtn.addEventListener('click', async () => {
+  camBtn.disabled = true; camBtn.textContent = 'Loading…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' }, audio: false });
+    video = document.createElement('video');
+    video.srcObject = stream; video.muted = true; video.playsInline = true;
+    await video.play();
+    const V = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+    const { FaceLandmarker, FilesetResolver } = await import(`${V}/vision_bundle.mjs`);
+    const files = await FilesetResolver.forVisionTasks(`${V}/wasm`);
+    landmarker = await FaceLandmarker.createFromOptions(files, {
+      baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate: 'GPU' },
+      runningMode: 'VIDEO', numFaces: 1
+    });
+    camBtn.textContent = 'Head tracking on';
+  } catch (err) {
+    console.warn(err);
+    camBtn.disabled = false; camBtn.textContent = 'Camera unavailable — retry';
+  }
+});
+
+function detect(now) {
+  if (!landmarker || !video || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const lm = landmarker.detectForVideo(video, now).faceLandmarks?.[0];
+  if (!lm) return;
+  const nose = lm[NOSE], a = lm[EYE_A], b = lm[EYE_B];
+  const eyeGap = Math.hypot(b.x - a.x, b.y - a.y);            // bigger = closer to the screen
+  face = {
+    x: -(nose.x - .5) * 2,                                    // webcam image is not mirrored
+    y: -(nose.y - .5) * 2,
+    z: Math.min(1, Math.max(-1, (eyeGap - 0.16) / 0.12))
+  };
+  lastFaceT = now;
+}
+
+let lastStatus = '';
+const setStatus = t => { if (t !== lastStatus) statusEl.textContent = lastStatus = t; };
+const sceneNote = () => splatState === 'loading' ? ' · loading splat…' : splatState === 'failed' ? ' · splat failed, showing room' : '';
+
+// ---------- loop ----------
+const pose = { x: 0, y: 0, z: 0 };
+let prev = performance.now(), wasTracking = false;
+
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), dt = Math.min(.1, (now - prev) / 1000); prev = now;
+  detect(now);
+
+  const tracking = face && now - lastFaceT < cfg.holdMs;
+  if (tracking) {
+    if (!wasTracking) { fx.reset(); fy.reset(); fz.reset(); }
+    const tx = fx.filter(face.x, dt, cfg.minCutoff, cfg.beta);
+    const ty = fy.filter(face.y, dt, cfg.minCutoff, cfg.beta);
+    const tz = fz.filter(face.z, dt, cfg.minCutoff, cfg.beta);
+    const k = 1 - Math.exp(-dt / 0.06);                       // short blend so re-acquiring never snaps
+    pose.x += (tx - pose.x) * k; pose.y += (ty - pose.y) * k; pose.z += (tz - pose.z) * k;
+    setStatus('tracking head' + sceneNote());
+  } else {
+    const k = 1 - Math.exp(-dt / ((wasTracking || now - lastFaceT < cfg.holdMs + 600 ? cfg.easeMs : cfg.mouseMs) / 1000));
+    pose.x += (mouse.x - pose.x) * k; pose.y += (mouse.y - pose.y) * k; pose.z += (0 - pose.z) * k;
+    setStatus((landmarker ? 'no face — mouse' : 'mouse') + sceneNote());
+  }
+  wasTracking = tracking;
+
+  const sx = cfg.invertX ? -1 : 1;
+  const cam = mode === 'splat' && cfg.splat.fit === 'camera';
+  const k = cam ? cfg.splat.strength : 1, dist = cam ? camDist() : cfg.viewDist;
+  setWindowCamera(
+    sx * pose.x * cfg.strengthX * cfg.halfW * k,
+    pose.y * cfg.strengthY * halfH * k,
+    dist * (1 - pose.z * cfg.depthStrength * (cam ? 0.6 : 1))
+  );
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
