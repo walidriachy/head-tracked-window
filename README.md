@@ -2,6 +2,8 @@
 
 A web page that turns your screen into a window. Behind the glass is a 3D haunted corridor; move your head (webcam) or your mouse and the view shifts the way it would through a real window: near door frames slide across far ones, and the far end of the hall barely moves.
 
+**Live demo: <https://walidriachy.github.io/head-tracked-window/>** (the 66 MB scene takes a few seconds to load; use a desktop browser)
+
 ![The source photo the 3D scene was built from](assets/corridor.png)
 
 It is one HTML file, no build step, no backend.
